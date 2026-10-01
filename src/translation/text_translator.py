@@ -1,0 +1,416 @@
+import logging
+import torch
+from deep_translator import GoogleTranslator
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from src.utils import config
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class LLMTranslator:
+    def __init__(self, model_id="tencent/HY-MT1.5-1.8B"):
+        self.model_id = model_id
+        self.model = None
+        self.tokenizer = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Determine model capabilities/prompt style
+        self.is_llama = "llama" in model_id.lower()
+        self.is_alma = "alma" in model_id.lower()
+        self.is_hymt = "hy-mt" in model_id.lower()
+
+    def unload_model(self):
+        """Unload model to free VRAM."""
+        if self.model:
+            logger.info(f"Unloading {self.model_id}...")
+            del self.model
+            del self.tokenizer
+            self.model = None
+            self.tokenizer = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("LLM Translator unloaded.")
+
+    def load_model(self, token=None):
+        if self.model:
+            return
+        
+        logger.info(f"Loading {self.model_id} on {self.device}...")
+        try:
+            # Use 'token' instead of 'use_auth_token' for newer transformers versions, 
+            # but 'token' is backwards compatible in many recent versions. 
+            # If using very old transformers, might need check. Assuming >=4.48.0 from docker reqs.
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True, token=token)
+            
+            # Use 4-bit quantization ONLY on CUDA
+            quantization_config = None
+            if self.device == "cuda":
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4"
+                )
+            
+            # Load model
+            # For CPU, we might need to be explicit about dtype to avoid OOM or Half errors
+            torch_dtype = "auto"
+            if self.device == "cpu":
+                torch_dtype = torch.float32
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_id, 
+                device_map="auto" if self.device == "cuda" else "cpu", 
+                quantization_config=quantization_config,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                token=token
+            )
+            
+            # Ensure proper pad token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Critical for batched generation with LLaMA/decoder models
+            self.tokenizer.padding_side = 'left'
+                
+            logger.info(f"{self.model_id} loaded successfully.")
+            
+        except Exception as e:
+            if "CUDA" in str(e) and self.device == "cuda":
+                logger.warning(f"CUDA Error loading LLM: {e}")
+                logger.warning("Switching to CPU fallback for LLM (Warning: Slow, No Quantization)...")
+                # Unload partial
+                self.model = None
+                self.tokenizer = None
+                if torch.cuda.is_available(): torch.cuda.empty_cache()
+                
+                self.device = "cpu"
+                # Retry
+                self.load_model()
+                return
+
+            logger.error(f"Failed to load LLM: {e}")
+            raise
+
+    def get_prompt(self, text, source_lang, target_lang, context_prev=None, context_next=None):
+        """Generates prompt based on model type and global context."""
+        from src.utils.languages import get_language_name
+        
+        # Convert codes to full names (e.g. "en" -> "English")
+        source_name = get_language_name(source_lang)
+        target_name = get_language_name(target_lang)
+        
+        # Standard Translation Prompt
+        if self.is_llama:
+            # Llama 3.1 Instruct
+            sys_prompt = (
+                "You are a professional video translator. Translate the user's text accurately, "
+                "preserving tone and style. Do not add any explanations."
+            )
+            if context_prev:
+                sys_prompt += f"\nContext (Previous Line): {context_prev}"
+                
+            user_prompt = f"Translate from {source_name} to {target_name}:\n\n{text}"
+            
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            
+            if self.tokenizer.chat_template:
+                return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            else:
+                 return f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{sys_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+        elif self.is_alma:
+            # ALMA-R (Advanced Language Model-based Translator)
+            # ALMA uses specific formatting: "Translate this from {src} to {tgt}:\n{src_text}\n{tgt_text}"
+            # Reference: https://github.com/fe1ixxu/ALMA
+            # NOTE: ALMA expects full English names (e.g. English, French)
+            prompt = f"Translate this from {source_name} to {target_name}:\n{source_name}: {text}\n{target_name}:"
+            logger.info(f"ALMA Prompt: {repr(prompt)}")
+            return prompt
+            
+        else:
+            # HY-MT (Default / Fallback)
+            messages = [{"role": "user", "content": f"Translate the following text from {source_name} to {target_name}:\n{text}"}]
+            if self.tokenizer.chat_template:
+                 return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            return f"<|user|>\nTranslate from {source_name} to {target_name}:\n{text}\n<|assistant|>\n"
+
+    def translate_batch(self, texts, source_lang_code, target_lang_code, token=None):
+        if not texts: return []
+        self.load_model(token=token)
+        
+        prompts = [self.get_prompt(t, source_lang_code, target_lang_code) for t in texts]
+        
+        try:
+            # [Fix] Enforce truncation and max length
+            self.tokenizer.model_max_length = 2048 # Explicitly set
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(self.device)
+            
+            # [Fix] Safety check for Token ID OOB (Root cause of CUDA assert in Embedding)
+            vocab_size = self.model.config.vocab_size
+            
+            # Check for negatives
+            if (inputs.input_ids < 0).any():
+                logger.warning("Found negative token IDs. Clamping to 0.")
+                inputs.input_ids[inputs.input_ids < 0] = 0
+                
+            # Check for overflow
+            if (inputs.input_ids >= vocab_size).any():
+                logger.warning("Found token IDs exceeding vocab size. Clamping...")
+                inputs.input_ids[inputs.input_ids >= vocab_size] = self.tokenizer.unk_token_id or 0
+            
+            # Verify pad_token_id
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None or pad_id >= vocab_size or pad_id < 0:
+                logger.warning(f"Invalid pad_token_id {pad_id}. Resetting to eos_token_id or 0.")
+                pad_id = self.tokenizer.eos_token_id
+                if pad_id is None or pad_id >= vocab_size:
+                    pad_id = 0
+                self.tokenizer.pad_token_id = pad_id
+            
+            with torch.no_grad():
+                # [Stability Fix] Disable autocast and use greedy decoding to prevent CUDA asserts
+                # caused by sampling from unstable distributions in 4-bit models on Windows.
+                outputs = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=512, 
+                    do_sample=False, # Robustness: greedy decoding
+                    num_beams=1,
+                    pad_token_id=pad_id
+                )
+                torch.cuda.synchronize()
+                
+            decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            
+            # Slice input from output (causal LM returns input+output)
+            input_len = inputs.input_ids.shape[1]
+            gen_tokens = outputs[:, input_len:]
+            
+            final_decoded = self.tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
+            
+            return [r.strip() for r in final_decoded]
+
+        except Exception as e:
+            logger.error(f"Batch translation failed: {e}")
+            return texts
+            
+    def translate_context_aware(self, text, source_lang, target_lang, prev_text=None, token=None):
+        """Translates a single segment with context."""
+        self.load_model(token=token)
+        prompt = self.get_prompt(text, source_lang, target_lang, context_prev=prev_text)
+        
+        try:
+            # [Fix] Enforce truncation and max length
+            self.tokenizer.model_max_length = 2048
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+            
+            # [Fix] Safety check
+            vocab_size = self.model.config.vocab_size
+            if (inputs.input_ids < 0).any(): inputs.input_ids[inputs.input_ids < 0] = 0
+            if (inputs.input_ids >= vocab_size).any():
+                inputs.input_ids[inputs.input_ids >= vocab_size] = self.tokenizer.unk_token_id or 0
+                
+            # Verify pad_token_id
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None or pad_id >= vocab_size or pad_id < 0:
+                pad_id = self.tokenizer.eos_token_id or 0
+                self.tokenizer.pad_token_id = pad_id
+
+            with torch.no_grad():
+                # [Stability Fix] Disable autocast and use greedy decoding to prevent CUDA asserts
+                outputs = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=512, 
+                    do_sample=False,
+                    num_beams=1,
+                    pad_token_id=pad_id
+                )
+                torch.cuda.synchronize()
+             
+            # Slice input from output
+            input_len = inputs.input_ids.shape[1]
+            gen_tokens = outputs[0][input_len:]
+            decoded = self.tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+            
+            # Post-process ALMA
+            if self.is_alma:
+                 from src.utils.languages import get_language_name
+                 target_name = get_language_name(target_lang)
+                 if f"{target_name}:" in decoded:
+                     decoded = decoded.split(f"{target_name}:")[-1].strip()
+                 
+            return decoded
+            
+        except Exception as e:
+            logger.error(f"Context translation failed: {e}")
+            return text
+
+    def translate(self, text, source_lang, target_lang):
+        return self.translate_batch([text], source_lang, target_lang)[0]
+
+
+class Translator:
+    def __init__(self):
+        self.translator_cache = {}
+        self.llm_translator = None 
+        # Import centralized languages
+        from src.utils import languages
+        self.languages = languages
+        self.cache_file = config.TEMP_DIR / "translation_cache.json"
+        self.cache = self._load_cache()
+
+    def unload_model(self):
+        """Unload any loaded LLM and clear caches."""
+        if self.llm_translator:
+            self.llm_translator.unload_model()
+            self.llm_translator = None
+        self.translator_cache.clear()
+
+    def _load_cache(self):
+        import json
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception: return {}
+        return {}
+        
+    def _save_cache(self):
+        import json
+        try:
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self.cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save translation cache: {e}")
+
+    def get_google_translator(self, target_lang):
+        # Use centralized map
+        code = self.languages.get_language_code(target_lang)
+        
+        if code not in self.translator_cache:
+            self.translator_cache[code] = GoogleTranslator(source='auto', target=code)
+        return self.translator_cache[code], code
+
+    def translate_segments(self, segments, target_lang, model="google", source_lang="auto", optimize=False, check_cancel_callback=None, hf_token=None):
+        """
+        Translates segments using selected model.
+        optimize: If True, uses sequential context-aware translation (slower but better).
+        check_cancel_callback: Function to call to check for cancellation.
+        """
+        if not segments: return []
+        
+        _, target_code = self.get_google_translator(target_lang)
+        source_code = source_lang if source_lang != "auto" else "en"
+        
+        translated_segments = []
+        segments_to_trans = []
+        map_indices = []
+        
+        # Check Cache
+        for i, seg in enumerate(segments):
+            if check_cancel_callback and i % 10 == 0: check_cancel_callback()
+            
+            key = f"{source_code}|{target_code}|{seg['text'].strip()}|{model}"
+            if key in self.cache:
+                s = seg.copy()
+                s['translated_text'] = self.cache[key]
+                translated_segments.append(s)
+            else:
+                segments_to_trans.append(seg)
+                map_indices.append(i)
+                # Placeholder to preserve order
+                translated_segments.append(None)
+                
+        if not segments_to_trans:
+            return translated_segments
+                
+        # Batch Processing
+        batch_size = 10 if model == "google" else 4
+        
+        # Log stats
+        logger.info(f"Translating {len(segments_to_trans)}/{len(segments)} items (Cache Hit: {len(segments)-len(segments_to_trans)})")
+        
+        newly_translated = []
+        if model in ["hymt", "llama", "alma"]:
+            model_id_map = {
+                "hymt": "tencent/HY-MT1.5-1.8B",
+                "llama": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                "alma": "haoranxu/ALMA-7B-R"
+            }
+            mid = model_id_map.get(model, "tencent/HY-MT1.5-1.8B")
+            
+            if self.llm_translator and self.llm_translator.model_id != mid:
+                self.llm_translator.unload_model()
+                self.llm_translator = None
+                
+            if not self.llm_translator:
+                self.llm_translator = LLMTranslator(mid)
+                
+            logger.info(f"Translating {len(segments)} items with {model} (Optimize={optimize})...")
+            
+            if optimize:
+                # Sequential Context-Aware Mode (only for uncached segments)
+                prev_text = None
+                for i, seg in enumerate(segments_to_trans):
+                    if check_cancel_callback: check_cancel_callback()
+                    logger.info(f"Translating segment {i+1}/{len(segments_to_trans)} (Context-Aware)...")
+                    trans_text = self.llm_translator.translate_context_aware(
+                        seg['text'], source_code, target_code, prev_text=prev_text, token=hf_token
+                    )
+                    
+                    new_s = seg.copy()
+                    new_s['translated_text'] = trans_text
+                    newly_translated.append(new_s)
+                    
+                    # Update context for next iteration
+                    prev_text = trans_text
+            else:
+                # Fast Batch Mode (No inter-segment context)
+                texts = [s['text'] for s in segments_to_trans] # FIX: Use segments_to_trans, not segments (which includes cached ones that we skip)
+                # Wait, 'segments' logic earlier populated 'translated_segments' with cached ones.
+                # So we only need to translate 'segments_to_trans'.
+                
+                # Smaller chunks for Llama
+                chunk_size = 4 if "llama" in model or "alma" in model else 8 
+                
+                trans_texts = []
+                for i in range(0, len(texts), chunk_size):
+                    if check_cancel_callback: check_cancel_callback()
+                    chunk = texts[i:i+chunk_size]
+                    trans_texts.extend(self.llm_translator.translate_batch(chunk, source_code, target_code, token=hf_token))
+                    
+                for i, seg in enumerate(segments_to_trans):
+                    new_s = seg.copy()
+                    new_s['translated_text'] = trans_texts[i]
+                    newly_translated.append(new_s)
+            
+            # Unload after use
+            self.llm_translator.unload_model()
+            
+        else:
+            # Google
+            translator, _ = self.get_google_translator(target_lang)
+            for seg in segments:
+                s = seg.copy()
+                s['translated_text'] = translator.translate(seg['text'])
+                newly_translated.append(s)
+
+        # Merge results and update cache
+        for idx, seg in zip(map_indices, newly_translated):
+            translated_segments[idx] = seg
+            # update cache
+            key = f"{source_code}|{target_code}|{seg['text'].strip()}|{model}"
+            self.cache[key] = seg['translated_text']
+            
+        self._save_cache()
+                
+        return translated_segments
+
+if __name__ == "__main__":
+    tr = Translator()
+    # print(tr.translate_text("Hello world", "Spanish", model="hymt"))
+
